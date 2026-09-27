@@ -1,0 +1,12 @@
+# MATLAB/Simulink build cache (regenerated otomatis saat model dibuka/dijalankan)
+slprj/
+*.slxc
+*.autosave
+
+# Data hasil logging/uji (laptop/logger.py) - jangan ikut ter-commit tiap run
+laptop/data/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+*.swp

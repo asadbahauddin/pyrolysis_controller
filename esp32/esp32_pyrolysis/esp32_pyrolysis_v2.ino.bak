@@ -1,0 +1,670 @@
+// ============================================================
+// esp32_pyrolysis.ino
+// Firmware ESP32 untuk sistem pyrolysis: dashboard diagnostik via
+// WiFi Access Point + pengiriman data status ke Arduino UNO (LCD)
+// lewat Serial2 dalam format JSON setiap 500ms.
+//
+// PERUBAHAN: Tambah log suhu ke Serial Monitor setiap 2 detik
+// ============================================================
+#include <WiFi.h>
+#include <WebServer.h>
+#include <SPI.h>
+#include <SD.h>
+#include <max6675.h>
+
+// ------------------------------------------------------------
+// Pin map
+// ------------------------------------------------------------
+#define PIN_FAN_PWM       25   // Fan DC PWM (MOSFET IRLB8721)
+#define PIN_OIL_PUMP      26   // Oil Pump Relay (via PC817+BD139)
+#define PIN_WATER_PUMP    27   // Water Pump Relay (via PC817+BD139)
+#define PIN_TIPPING       34   // Tipping Bucket Hall Sensor
+
+#define PIN_MAX6675_CS     5   // HSPI  <-- strapping pin, aman sebagai CS (boot: pull-up = CS HIGH = chip idle)
+#define PIN_MAX6675_SCK   14   // HSPI
+#define PIN_MAX6675_MISO   2   // HSPI  <-- strapping pin, AWAS: jangan pakai sebagai MISO di sistem final
+
+#define PIN_SD_CS          4   // VSPI
+#define PIN_SD_SCK        18   // VSPI
+#define PIN_SD_MISO       19   // VSPI
+#define PIN_SD_MOSI       23   // VSPI
+
+#define PIN_SERIAL2_TX    17
+#define PIN_SERIAL2_RX    16
+
+#define PWM_CHANNEL        0
+#define PWM_FREQ        5000
+#define PWM_RESOLUTION     8
+
+#define VOLUME_PER_TIP_ML  1.42
+#define DEFAULT_SETPOINT 300.0
+
+// ------------------------------------------------------------
+// Interval log Serial Monitor suhu (ms)
+// Ubah nilai ini untuk mempercepat/memperlambat update
+// ------------------------------------------------------------
+#define TEMP_LOG_INTERVAL_MS  2000   // log suhu ke Serial setiap 2 detik
+
+// ------------------------------------------------------------
+// WiFi Access Point
+// ------------------------------------------------------------
+#define WIFI_SSID     "Pyrolysis-Diag"
+#define WIFI_PASSWORD "12345678"
+#define HTTP_PORT     80
+
+#define SERIAL2_INTERVAL_MS 500
+
+// ------------------------------------------------------------
+// Objek global
+// ------------------------------------------------------------
+static WebServer server(HTTP_PORT);
+static MAX6675 thermocouple(PIN_MAX6675_SCK, PIN_MAX6675_CS, PIN_MAX6675_MISO);
+
+static volatile unsigned long tipCount = 0;
+static unsigned long lastTipIsrMs = 0;
+#define TIP_DEBOUNCE_MS 15
+
+static bool oilState = false;
+static bool waterState = false;
+static uint8_t fanPct = 0;
+static uint8_t fanRawValue = 0;
+
+static float lastGoodTemp = 25.0;
+static unsigned long lastSerial2Ms = 0;
+
+// *** NEWs: timer untuk log suhu ke Serial Monitor ***
+static unsigned long lastTempLogMs = 0;
+static uint32_t tempReadCount = 0;  // jumlah total pembacaan sejak boot
+
+// ------------------------------------------------------------
+// ISR Tipping Bucket
+// ------------------------------------------------------------
+void IRAM_ATTR onTip() {
+  unsigned long now = millis();
+  if (now - lastTipIsrMs >= TIP_DEBOUNCE_MS) {
+    tipCount++;
+    lastTipIsrMs = now;
+  }
+}
+
+// ------------------------------------------------------------
+// Baca suhu MAX6675, dengan validasi rentang normal
+// ------------------------------------------------------------
+float readTemperature() {
+  float t = thermocouple.readCelsius();
+  if (isnan(t)) return NAN;
+  if (t < 0 || t > 1000) return t;
+  lastGoodTemp = t;
+  return t;
+}
+
+// ------------------------------------------------------------
+// LOG SUHU KE SERIAL MONITOR
+// Dipanggil dari loop() setiap TEMP_LOG_INTERVAL_MS
+// ------------------------------------------------------------
+static void logTempToSerial() {
+  float t = readTemperature();
+  tempReadCount++;
+
+  Serial.print(F("[TEMP] #"));
+  Serial.print(tempReadCount);
+  Serial.print(F("  uptime="));
+  Serial.print(millis() / 1000);
+  Serial.print(F("s  ->  "));
+
+  if (isnan(t)) {
+    Serial.println(F("ERROR: NaN - sensor tidak terhubung / thermocouple putus"));
+  } else if (t < 0) {
+    Serial.print(F("WARN: suhu negatif ("));
+    Serial.print(t, 2);
+    Serial.println(F(" C) - cek wiring SCK/CS/MISO"));
+  } else if (t > 1000) {
+    Serial.print(F("WARN: suhu >1000 C ("));
+    Serial.print(t, 2);
+    Serial.println(F(" C) - cek koneksi thermocouple"));
+  } else if (t == 0.0f) {
+    // 0.0 persis biasanya artinya SPI tidak nyambung sama sekali
+    Serial.println(F("WARN: 0.00 C - kemungkinan SPI tidak nyambung, cek pin CS/SCK/MISO"));
+  } else {
+    Serial.print(t, 2);
+    Serial.println(F(" C  [OK]"));
+  }
+}
+
+// ------------------------------------------------------------
+// Helper HTTP JSON
+// ------------------------------------------------------------
+static void sendJson(const String &json) {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", json);
+}
+
+// ------------------------------------------------------------
+// Handler rute HTTP
+// ------------------------------------------------------------
+static void handleRoot();
+
+static void handlePing() {
+  sendJson(F("{\"ok\":true}"));
+}
+
+static void handleTestTemp() {
+  float t = readTemperature();
+  char buf[192];
+
+  // Cetak ke Serial juga saat user pencet "Baca Suhu" di web
+  Serial.print(F("[TEMP/WEB] Permintaan dari browser -> "));
+
+  if (isnan(t)) {
+    Serial.println(F("ERROR NaN"));
+    snprintf(buf, sizeof(buf),
+             "{\"type\":\"TEMP\",\"value\":null,\"error\":\"Sensor MAX6675 tidak terhubung / thermocouple putus\"}");
+  } else if (t < 0 || t > 1000) {
+    Serial.print(F("OUT-OF-RANGE: "));
+    Serial.print(t, 2);
+    Serial.println(F(" C"));
+    snprintf(buf, sizeof(buf),
+             "{\"type\":\"TEMP\",\"value\":%.1f,\"error\":\"Suhu di luar rentang normal (0-1000C), cek wiring/sensor\"}", t);
+  } else {
+    Serial.print(t, 2);
+    Serial.println(F(" C  [OK]"));
+    snprintf(buf, sizeof(buf), "{\"type\":\"TEMP\",\"value\":%.1f}", t);
+  }
+  sendJson(buf);
+}
+
+static void handleTipGet() {
+  noInterrupts();
+  unsigned long c = tipCount;
+  interrupts();
+  char buf[80];
+  snprintf(buf, sizeof(buf), "{\"type\":\"TIP\",\"count\":%lu}", c);
+  sendJson(buf);
+}
+
+static void handleTipReset() {
+  noInterrupts();
+  tipCount = 0;
+  interrupts();
+  sendJson(F("{\"type\":\"TIP\",\"count\":0}"));
+}
+
+// Relay active-LOW: ON = LOW, OFF = HIGH
+static void handleOilOn() {
+  digitalWrite(PIN_OIL_PUMP, LOW);
+  oilState = true;
+  Serial.println(F("[OIL] ON"));
+  sendJson(F("{\"type\":\"OIL\",\"state\":true}"));
+}
+static void handleOilOff() {
+  digitalWrite(PIN_OIL_PUMP, HIGH);
+  oilState = false;
+  Serial.println(F("[OIL] OFF"));
+  sendJson(F("{\"type\":\"OIL\",\"state\":false}"));
+}
+
+static void handleWaterOn() {
+  digitalWrite(PIN_WATER_PUMP, LOW);
+  waterState = true;
+  Serial.println(F("[WATER] ON"));
+  sendJson(F("{\"type\":\"WATER\",\"state\":true}"));
+}
+static void handleWaterOff() {
+  digitalWrite(PIN_WATER_PUMP, HIGH);
+  waterState = false;
+  Serial.println(F("[WATER] OFF"));
+  sendJson(F("{\"type\":\"WATER\",\"state\":false}"));
+}
+
+static void handleFan(int pct) {
+  int raw = (pct * 255) / 100;
+  ledcWrite(PWM_CHANNEL, raw);
+  fanRawValue = (uint8_t)raw;
+  fanPct = (uint8_t)pct;
+  Serial.print(F("[FAN] "));
+  Serial.print(pct);
+  Serial.print(F("%  raw="));
+  Serial.println(raw);
+  char buf[80];
+  snprintf(buf, sizeof(buf), "{\"type\":\"FAN\",\"pct\":%d,\"raw\":%d}", pct, raw);
+  sendJson(buf);
+}
+
+static bool mountSD() {
+  SD.end();
+  return SD.begin(PIN_SD_CS, SPI, 25000000);
+}
+
+static void handleTestSD() {
+  bool ok = mountSD();
+  char buf[192];
+
+  if (!ok) {
+    snprintf(buf, sizeof(buf),
+             "{\"type\":\"SD\",\"ok\":false,\"error\":\"Gagal mount - cek pemasangan kartu, format FAT32, atau wiring CS/SCK/MISO/MOSI\"}");
+  } else if (SD.cardType() == CARD_NONE) {
+    snprintf(buf, sizeof(buf), "{\"type\":\"SD\",\"ok\":false,\"error\":\"Tidak ada kartu SD terdeteksi di slot\"}");
+  } else {
+    uint64_t mb = SD.cardSize() / (1024ULL * 1024ULL);
+    snprintf(buf, sizeof(buf), "{\"type\":\"SD\",\"ok\":true,\"mb\":%llu}", (unsigned long long)mb);
+  }
+  sendJson(buf);
+}
+
+static void handleTestAll() {
+  int fanRaw = (50 * 255) / 100;
+  ledcWrite(PWM_CHANNEL, fanRaw);
+  fanRawValue = fanRaw; fanPct = 50;
+  Serial.println(F("[ALL] Fan 50%..."));
+  delay(1000);
+  ledcWrite(PWM_CHANNEL, 0);
+  fanRawValue = 0; fanPct = 0;
+
+  digitalWrite(PIN_OIL_PUMP, LOW); oilState = true;
+  Serial.println(F("[ALL] Oil ON..."));
+  delay(1000);
+  digitalWrite(PIN_OIL_PUMP, HIGH); oilState = false;
+
+  digitalWrite(PIN_WATER_PUMP, LOW); waterState = true;
+  Serial.println(F("[ALL] Water ON..."));
+  delay(1000);
+  digitalWrite(PIN_WATER_PUMP, HIGH); waterState = false;
+
+  float t = readTemperature();
+  bool tempOk = !isnan(t) && t >= 0 && t <= 1000;
+
+  Serial.print(F("[ALL] Suhu: "));
+  if (isnan(t)) Serial.println(F("NaN (ERROR)"));
+  else { Serial.print(t, 2); Serial.println(F(" C")); }
+
+  bool sdOk = mountSD();
+  uint64_t mb = 0;
+  if (sdOk) {
+    if (SD.cardType() == CARD_NONE) sdOk = false;
+    else mb = SD.cardSize() / (1024ULL * 1024ULL);
+  }
+  Serial.print(F("[ALL] SD: "));
+  Serial.println(sdOk ? "OK" : "GAGAL");
+
+  noInterrupts();
+  unsigned long tips = tipCount;
+  interrupts();
+
+  char buf[256];
+  snprintf(buf, sizeof(buf),
+           "{\"type\":\"ALL\",\"tempOk\":%s,\"temp\":%.1f,\"sdOk\":%s,\"mb\":%llu,\"tips\":%lu}",
+           tempOk ? "true" : "false", isnan(t) ? -1.0f : t,
+           sdOk ? "true" : "false", (unsigned long long)mb, tips);
+  sendJson(buf);
+}
+
+// ------------------------------------------------------------
+// Dashboard HTML (PROGMEM) - tidak berubah
+// ------------------------------------------------------------
+const char HTML[] PROGMEM = R"HTMLDIAG(
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Pyrolysis Diagnostic</title>
+<style>
+  :root {
+    --bg: #1a1a2e;
+    --card: #16213e;
+    --border: #2a3358;
+    --text: #eaeaea;
+    --text-dim: #8f9bb3;
+    --teal: #4ecca3;
+    --red: #e94560;
+    --yellow: #ffd700;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    max-width: 460px; margin: 0 auto; padding: 12px 14px 30px 14px;
+  }
+  h1 { font-size: 17px; text-align: center; margin: 10px 0 4px 0; }
+  #connBar {
+    display: flex; align-items: center; justify-content: center; gap: 8px;
+    font-size: 12px; padding: 6px; border-radius: 8px; margin-bottom: 14px;
+    background: var(--card); border: 1px solid var(--border);
+  }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--red); }
+  .dot.on { background: var(--teal); }
+
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 10px; padding: 14px; margin-bottom: 12px;
+  }
+  .card h3 { margin: 0 0 10px 0; font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-dim); }
+
+  button {
+    border: none; border-radius: 7px; padding: 10px 14px; font-size: 13px; font-weight: 700;
+    cursor: pointer; color: #fff; background: #33406e;
+  }
+  button.primary { background: var(--teal); color: #06251c; }
+  button.danger { background: var(--red); }
+  button.warn { background: var(--yellow); color: #3a2e00; }
+  .btn-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+  .btn-row button { flex: 1; min-width: 60px; }
+
+  input[type=range] { width: 100%; accent-color: var(--teal); margin: 8px 0; }
+
+  .result {
+    margin-top: 10px; padding: 10px; border-radius: 6px; font-size: 13px;
+    background: #0d1229; border: 1px solid var(--border); min-height: 20px;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .result.ok { border-color: var(--teal); color: var(--teal); }
+  .result.err { border-color: var(--red); color: var(--red); }
+  .result.info { color: var(--text); }
+
+  .hint { font-size: 11px; color: var(--text-dim); margin-top: 6px; line-height: 1.4; }
+  .status-line { font-size: 13px; margin-top: 6px; }
+  .status-line b { color: var(--teal); }
+  .status-line b.off { color: var(--text-dim); }
+</style>
+</head>
+<body>
+
+<h1>PYROLYSIS DIAGNOSTIC</h1>
+<div id="connBar"><span class="dot" id="connDot"></span><span id="connText">Menghubungkan...</span></div>
+
+<!-- 1. MAX6675 -->
+<div class="card">
+  <h3>1. MAX6675 Thermocouple</h3>
+  <button class="primary" onclick="testTemp()">Baca Suhu</button>
+  <div class="result info" id="tempResult">-- belum dites --</div>
+</div>
+
+<!-- 2. Tipping Bucket -->
+<div class="card">
+  <h3>2. Tipping Bucket (GPIO34)</h3>
+  <div class="btn-row">
+    <button class="primary" id="btnMonitor" onclick="toggleMonitor()">Mulai Monitor</button>
+    <button class="danger" onclick="resetTip()">Reset Counter</button>
+  </div>
+  <div class="result info" id="tipResult">Tips: -- | Volume: -- mL</div>
+</div>
+
+<!-- 3. Fan -->
+<div class="card">
+  <h3>3. Fan DC (GPIO25)</h3>
+  <input type="range" id="fanSlider" min="0" max="100" step="10" value="0" oninput="onFanSlide(this.value)">
+  <div class="btn-row">
+    <button onclick="setFan(0)">OFF</button>
+    <button onclick="setFan(30)">30%</button>
+    <button onclick="setFan(50)">50%</button>
+    <button class="warn" onclick="setFan(100)">100%</button>
+  </div>
+  <div class="result info" id="fanResult">PWM raw: 0 / 255</div>
+</div>
+
+<!-- 4. Oil Pump -->
+<div class="card">
+  <h3>4. Oil Pump (GPIO26)</h3>
+  <div class="btn-row">
+    <button class="primary" onclick="oilCmd('on')">ON</button>
+    <button class="danger" onclick="oilCmd('off')">OFF</button>
+  </div>
+  <div class="status-line">Status: <b class="off" id="oilStatus">OFF</b></div>
+  <div class="hint">Jika relay tidak bunyi "klik": cek tegangan 12V ke coil relay, kontinuitas PC817 (LED sisi ESP32, transistor sisi relay), BD139 terpasang benar (E-B-C), dan ground ESP32 nyambung ke ground rangkaian relay.</div>
+</div>
+
+<!-- 5. Water Pump -->
+<div class="card">
+  <h3>5. Water Pump (GPIO27)</h3>
+  <div class="btn-row">
+    <button class="primary" onclick="waterCmd('on')">ON</button>
+    <button class="danger" onclick="waterCmd('off')">OFF</button>
+  </div>
+  <div class="status-line">Status: <b class="off" id="waterStatus">OFF</b></div>
+  <div class="hint">Sama seperti Oil Pump: cek jalur PC817+BD139, tegangan coil relay 12V, dan pastikan common ground. Kalau relay bunyi tapi pompa tidak jalan, cek kabel motor/pompa dan sumber 12V/220V ke pompa.</div>
+</div>
+
+<!-- 6. SD Card -->
+<div class="card">
+  <h3>6. SD Card (GPIO4)</h3>
+  <button class="primary" onclick="testSD()">Test SD Card</button>
+  <div class="result info" id="sdResult">-- belum dites --</div>
+</div>
+
+<!-- 7. Test All -->
+<div class="card">
+  <h3>7. Test Semua Sekaligus</h3>
+  <button class="warn" onclick="testAll()" style="width:100%;">JALANKAN SEMUA TEST</button>
+  <div class="hint">Urutan: Fan 50% (1s) &rarr; OFF, Oil ON (1s) &rarr; OFF, Water ON (1s) &rarr; OFF, baca suhu, test SD. Proses &plusmn;3 detik, tombol lain akan menunggu selesai.</div>
+  <div class="result info" id="allResult">-- belum dites --</div>
+</div>
+
+<script>
+var monitorActive = false;
+var monitorTimer = null;
+var connOk = false;
+
+function setResult(id, ok, text) {
+  var el = document.getElementById(id);
+  el.className = "result " + (ok === null ? "info" : (ok ? "ok" : "err"));
+  el.textContent = text;
+}
+
+function handleData(d) {
+  if (!d || !d.type) return;
+  switch (d.type) {
+    case "TEMP": {
+      if (d.error) setResult("tempResult", false, d.error + (d.value != null ? " (" + d.value.toFixed(1) + " C)" : ""));
+      else setResult("tempResult", true, "Suhu: " + d.value.toFixed(1) + " C");
+      break;
+    }
+    case "TIP": {
+      var vol = (d.count * 1.42).toFixed(2);
+      setResult("tipResult", null, "Tips: " + d.count + " | Volume: " + vol + " mL");
+      break;
+    }
+    case "OIL": {
+      var el = document.getElementById("oilStatus");
+      el.textContent = d.state ? "ON" : "OFF";
+      el.className = d.state ? "" : "off";
+      break;
+    }
+    case "WATER": {
+      var el = document.getElementById("waterStatus");
+      el.textContent = d.state ? "ON" : "OFF";
+      el.className = d.state ? "" : "off";
+      break;
+    }
+    case "FAN": {
+      document.getElementById("fanSlider").value = d.pct;
+      setResult("fanResult", null, "PWM raw: " + d.raw + " / 255  (" + d.pct + "%)");
+      break;
+    }
+    case "SD": {
+      if (d.ok) setResult("sdResult", true, "SD Card OK - Kapasitas: " + d.mb + " MB");
+      else setResult("sdResult", false, d.error || "SD Card gagal");
+      break;
+    }
+    case "ALL": {
+      var lines = [];
+      lines.push((d.tempOk ? "[OK] " : "[GAGAL] ") + "Suhu: " + d.temp.toFixed(1) + " C");
+      lines.push((d.sdOk ? "[OK] " : "[GAGAL] ") + "SD Card" + (d.sdOk ? (" (" + d.mb + " MB)") : ""));
+      lines.push("[INFO] Tipping bucket: " + d.tips + " tips");
+      lines.push("[INFO] Fan/Oil/Water sudah dites ON 1 detik lalu OFF - cek suara relay & putaran fan secara fisik.");
+      setResult("allResult", d.tempOk && d.sdOk, lines.join("\n"));
+      break;
+    }
+  }
+}
+
+function req(url, cb) {
+  fetch(url).then(function(r){ return r.json(); }).then(function(d){ handleData(d); if (cb) cb(d); })
+    .catch(function(e){ console.error(e); });
+}
+
+function testTemp() { req("/test/temp"); }
+function resetTip() { req("/tip/reset"); }
+function testSD() { setResult("sdResult", null, "Mengecek..."); req("/test/sd"); }
+function testAll() { setResult("allResult", null, "Menjalankan semua test (~3 detik)..."); req("/test/all"); }
+
+function oilCmd(state) { req("/oil/" + state); }
+function waterCmd(state) { req("/water/" + state); }
+
+function setFan(pct) { req("/fan/" + pct); }
+function onFanSlide(val) { req("/fan/" + val); }
+
+function toggleMonitor() {
+  monitorActive = !monitorActive;
+  var btn = document.getElementById("btnMonitor");
+  if (monitorActive) {
+    btn.textContent = "Stop Monitor";
+    req("/tip/get");
+    monitorTimer = setInterval(function(){ req("/tip/get"); }, 500);
+  } else {
+    btn.textContent = "Mulai Monitor";
+    clearInterval(monitorTimer);
+  }
+}
+
+function checkConn() {
+  fetch("/ping").then(function(r){ return r.json(); }).then(function(d){
+    connOk = !!d.ok;
+    document.getElementById("connDot").className = "dot on";
+    document.getElementById("connText").textContent = "Terhubung ke ESP32";
+  }).catch(function(){
+    connOk = false;
+    document.getElementById("connDot").className = "dot";
+    document.getElementById("connText").textContent = "Terputus dari ESP32";
+  });
+}
+
+checkConn();
+setInterval(checkConn, 3000);
+</script>
+</body>
+</html>
+)HTMLDIAG";
+
+static void handleRoot() {
+  server.send_P(200, "text/html", HTML);
+}
+
+// ------------------------------------------------------------
+// Kirim status ke Arduino UNO via Serial2
+// ------------------------------------------------------------
+static void sendStatusToArduino() {
+  noInterrupts();
+  unsigned long tips = tipCount;
+  interrupts();
+  float volume = tips * VOLUME_PER_TIP_ML;
+
+  const char *statusStr = (fanRawValue > 0 || oilState || waterState) ? "RUN" : "IDLE";
+
+  char buf[160];
+  snprintf(buf, sizeof(buf),
+           "{\"t\":%.1f,\"sp\":%.1f,\"pw\":%d,\"v\":%.2f,\"oil\":%d,\"water\":%d,\"s\":\"%s\"}\n",
+           lastGoodTemp, DEFAULT_SETPOINT, fanPct, volume,
+           oilState ? 1 : 0, waterState ? 1 : 0, statusStr);
+
+  Serial2.print(buf);
+}
+
+// ------------------------------------------------------------
+// Setup
+// ------------------------------------------------------------
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+  Serial.println(F("\n[esp32] Pyrolysis firmware booting..."));
+  Serial.println(F("================================================="));
+  Serial.println(F("  Serial Monitor Log Aktif"));
+  Serial.println(F("  Format: [TEMP] #<n>  uptime=<s>s  ->  <suhu> C"));
+  Serial.println(F("  Interval: setiap 2 detik"));
+  Serial.println(F("=================================================\n"));
+
+  // 1. Relay OFF dan Fan PWM 0 PERTAMA
+  digitalWrite(PIN_OIL_PUMP, HIGH);
+  digitalWrite(PIN_WATER_PUMP, HIGH);
+  pinMode(PIN_OIL_PUMP, OUTPUT);
+  pinMode(PIN_WATER_PUMP, OUTPUT);
+  pinMode(PIN_FAN_PWM, OUTPUT);
+
+  ledcSetup(PWM_CHANNEL, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttachPin(PIN_FAN_PWM, PWM_CHANNEL);
+  ledcWrite(PWM_CHANNEL, 0);
+
+  // 2. Init HSPI untuk MAX6675
+  pinMode(PIN_MAX6675_CS, OUTPUT);
+  digitalWrite(PIN_MAX6675_CS, HIGH);
+  delay(250);
+
+  // 3. Init VSPI untuk SD Card
+  SPI.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, PIN_SD_CS);
+
+  // 4. Attach interrupt tipping bucket
+  pinMode(PIN_TIPPING, INPUT);
+  attachInterrupt(digitalPinToInterrupt(PIN_TIPPING), onTip, FALLING);
+
+  // 5. Start Serial2 ke Arduino UNO
+  Serial2.begin(9600, SERIAL_8N1, PIN_SERIAL2_RX, PIN_SERIAL2_TX);
+
+  // 6. Start WiFi Access Point
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(WIFI_SSID, WIFI_PASSWORD);
+
+  // 7. Register semua routes
+  server.on("/", handleRoot);
+  server.on("/ping", handlePing);
+  server.on("/test/temp", handleTestTemp);
+  server.on("/tip/get", handleTipGet);
+  server.on("/tip/reset", handleTipReset);
+  server.on("/oil/on", handleOilOn);
+  server.on("/oil/off", handleOilOff);
+  server.on("/water/on", handleWaterOn);
+  server.on("/water/off", handleWaterOff);
+  server.on("/test/sd", handleTestSD);
+  server.on("/test/all", handleTestAll);
+
+  static const int fanPercents[] = {0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100};
+  for (int i = 0; i < 11; i++) {
+    int pct = fanPercents[i];
+    String path = "/fan/" + String(pct);
+    server.on(path, [pct]() { handleFan(pct); });
+  }
+
+  // 8. Start web server
+  server.begin();
+
+  // 9. Print info ke Serial Monitor
+  Serial.print(F("[esp32] AP SSID: "));
+  Serial.println(WIFI_SSID);
+  Serial.print(F("[esp32] IP address: "));
+  Serial.println(WiFi.softAPIP());
+  Serial.println(F("[esp32] Serial2 -> Arduino UNO siap (9600 baud)"));
+  Serial.println(F("[esp32] Ready. Buka IP di atas lewat browser.\n"));
+
+  // Baca suhu pertama kali langsung saat boot
+  Serial.println(F("[TEMP] Pembacaan awal saat boot:"));
+  logTempToSerial();
+}
+
+// ------------------------------------------------------------
+// Loop
+// ------------------------------------------------------------
+void loop() {
+  server.handleClient();
+
+  unsigned long now = millis();
+
+  // Kirim JSON ke Arduino setiap 500ms
+  if (now - lastSerial2Ms >= SERIAL2_INTERVAL_MS) {
+    lastSerial2Ms = now;
+    sendStatusToArduino();
+  }
+
+  // Log suhu ke Serial Monitor setiap TEMP_LOG_INTERVAL_MS
+  if (now - lastTempLogMs >= TEMP_LOG_INTERVAL_MS) {
+    lastTempLogMs = now;
+    logTempToSerial();
+  }
+}

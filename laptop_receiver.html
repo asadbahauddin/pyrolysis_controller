@@ -1,0 +1,537 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<title>Pyrolysis Research Data Collector</title>
+<style>
+  :root {
+    --bg: #f5f5f5;
+    --card: #ffffff;
+    --accent: #2196F3;
+    --text: #212121;
+    --text-dim: #757575;
+    --border: #e0e0e0;
+    --green: #43a047;
+    --red: #e53935;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: "Segoe UI", Roboto, Arial, sans-serif;
+  }
+  .mono { font-family: "Consolas", "Courier New", monospace; }
+
+  header {
+    background: var(--card); box-shadow: 0 1px 4px rgba(0,0,0,0.1);
+    padding: 12px 20px; display: flex; align-items: center; justify-content: space-between;
+  }
+  header h1 { font-size: 18px; margin: 0; }
+  header .right { display: flex; align-items: center; gap: 14px; }
+  .run-badge { background: var(--accent); color: #fff; padding: 4px 12px; border-radius: 12px; font-size: 13px; font-weight: 600; }
+  .live-dot { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 600; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--red); }
+  .dot.on { background: var(--green); }
+
+  .conn-bar { padding: 8px 20px; background: #eef4fb; display: flex; gap: 8px; align-items: center; font-size: 13px; }
+  .conn-bar input { padding: 5px 8px; border: 1px solid var(--border); border-radius: 4px; width: 160px; }
+  .conn-bar button { padding: 6px 12px; border: none; border-radius: 4px; background: var(--accent); color: #fff; cursor: pointer; font-size: 13px; }
+
+  .main-grid {
+    display: grid;
+    grid-template-columns: 220px 1fr 220px;
+    gap: 12px; padding: 12px 20px;
+  }
+  @media (max-width: 900px) { .main-grid { grid-template-columns: 1fr; } }
+
+  .card { background: var(--card); border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.12); padding: 14px; }
+  .card h3 { margin: 0 0 10px 0; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-dim); }
+
+  .kv { display: flex; justify-content: space-between; padding: 4px 0; font-size: 14px; }
+  .kv .k { color: var(--text-dim); }
+  .kv .v { font-weight: 700; }
+
+  .chart-toolbar { display: flex; gap: 12px; align-items: center; font-size: 12px; margin-bottom: 8px; flex-wrap: wrap; }
+  .chart-toolbar label { display: flex; align-items: center; gap: 4px; cursor: pointer; }
+
+  canvas#mainChart { width: 100%; height: 320px; border: 1px solid var(--border); border-radius: 6px; cursor: grab; background: #fcfcfc; }
+  #tooltip { position: fixed; background: #212121; color: #fff; font-size: 11px; padding: 6px 8px; border-radius: 4px; pointer-events: none; display: none; z-index: 50; }
+
+  .table-wrap { margin: 0 20px 12px 20px; background: var(--card); border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.12); }
+  .table-scroll { max-height: 320px; overflow-y: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { padding: 6px 10px; text-align: right; border-bottom: 1px solid var(--border); }
+  th:first-child, td:first-child { text-align: left; }
+  th { position: sticky; top: 0; background: #fafafa; color: var(--text-dim); font-weight: 600; }
+  tbody tr:nth-child(even) { background: #fafafa; }
+
+  .controls {
+    margin: 0 20px 20px 20px; background: var(--card); border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.12);
+    padding: 14px 20px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px;
+  }
+  .btn { border: none; border-radius: 6px; padding: 10px 18px; font-size: 14px; font-weight: 600; cursor: pointer; color: #fff; }
+  .btn-record { background: var(--red); }
+  .btn-stop { background: #616161; }
+  .btn-export { background: var(--accent); }
+  .btn-row { display: flex; gap: 8px; }
+  .status-text { font-size: 13px; color: var(--text-dim); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>PYROLYSIS RESEARCH DATA COLLECTOR</h1>
+  <div class="right">
+    <span class="run-badge" id="runBadge">Run #--</span>
+    <span class="live-dot"><span class="dot" id="liveDot"></span><span id="liveText">OFFLINE</span></span>
+  </div>
+</header>
+
+<div class="conn-bar">
+  <span>ESP32 IP:</span>
+  <input type="text" id="ipInput" value="192.168.4.1">
+  <button onclick="connectWS()">Connect</button>
+  <span id="connMsg" class="status-text"></span>
+  <label style="margin-left:auto;"><input type="checkbox" id="autoRecord"> Auto-record saat terhubung</label>
+</div>
+
+<div class="main-grid">
+  <div class="card">
+    <h3>Parameter Aktif</h3>
+    <div class="kv"><span class="k">State</span><span class="v" id="pState">--</span></div>
+    <div class="kv"><span class="k">T</span><span class="v mono" id="pTemp">-- °C</span></div>
+    <div class="kv"><span class="k">SP</span><span class="v mono" id="pSp">-- °C</span></div>
+    <div class="kv"><span class="k">PWM</span><span class="v mono" id="pPwm">--%</span></div>
+    <div class="kv"><span class="k">Kp</span><span class="v mono" id="pKp">--</span></div>
+    <div class="kv"><span class="k">Ki</span><span class="v mono" id="pKi">--</span></div>
+    <div class="kv"><span class="k">Kd</span><span class="v mono" id="pKd">--</span></div>
+    <div class="kv"><span class="k">Volume</span><span class="v mono" id="pVol">-- mL</span></div>
+    <div class="kv"><span class="k">Est. selesai</span><span class="v mono" id="pEst">--</span></div>
+  </div>
+
+  <div class="card">
+    <h3>Grafik Suhu Real-time (last 30 menit) — scroll=zoom, drag=pan, klik=detail</h3>
+    <div class="chart-toolbar">
+      <label><input type="checkbox" id="serSuhu" checked onchange="redrawChart()"> Suhu</label>
+      <label><input type="checkbox" id="serSp" checked onchange="redrawChart()"> Setpoint</label>
+      <label><input type="checkbox" id="serPwm" onchange="redrawChart()"> PWM</label>
+      <button class="btn" style="background:#9e9e9e;padding:4px 10px;font-size:12px;" onclick="resetZoom()">Reset Zoom</button>
+      <span id="overlayList" style="margin-left:auto;"></span>
+    </div>
+    <canvas id="mainChart" width="700" height="320"></canvas>
+  </div>
+
+  <div class="card">
+    <h3>Statistik Run Ini</h3>
+    <div class="kv"><span class="k">Volume</span><span class="v mono" id="sVol">-- mL</span></div>
+    <div class="kv"><span class="k">Efisiensi</span><span class="v mono" id="sEff">-- mL/h</span></div>
+    <div class="kv"><span class="k">ISE</span><span class="v mono" id="sIse">--</span></div>
+    <div class="kv"><span class="k">Score</span><span class="v mono" id="sScore">--</span></div>
+    <hr>
+    <div class="kv"><span class="k">Mean suhu</span><span class="v mono" id="sMean">--</span></div>
+    <div class="kv"><span class="k">Std dev</span><span class="v mono" id="sStd">--</span></div>
+    <div class="kv"><span class="k">Min / Max</span><span class="v mono" id="sMinMax">--</span></div>
+    <div class="kv"><span class="k">Overshoot</span><span class="v mono" id="sOvershoot">--</span></div>
+    <div class="kv"><span class="k">Rise time</span><span class="v mono" id="sRise">--</span></div>
+    <div class="kv"><span class="k">Settling time</span><span class="v mono" id="sSettle">--</span></div>
+    <div class="kv"><span class="k">SS error</span><span class="v mono" id="sSSErr">--</span></div>
+  </div>
+</div>
+
+<div class="table-wrap">
+  <div class="table-scroll" id="tableScroll">
+    <table>
+      <thead><tr><th>Elapsed</th><th>Suhu</th><th>SP</th><th>PWM</th><th>Vol mL</th><th>ISE</th></tr></thead>
+      <tbody id="logBody"></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="controls">
+  <div class="btn-row">
+    <button class="btn btn-record" id="btnRecord" onclick="toggleRecord()">&#9210; RECORD</button>
+    <button class="btn btn-export" onclick="exportCSV()">&#128190; EXPORT CSV</button>
+    <button class="btn btn-export" onclick="exportJSON()">&#128202; EXPORT JSON</button>
+  </div>
+  <div class="status-text" id="statusBar">Status: STOPPED | 0 titik | Koneksi: OFFLINE</div>
+</div>
+
+<div id="tooltip"></div>
+
+<script>
+// ==============================================================
+// State
+// ==============================================================
+var ws = null;
+var connected = false;
+var recording = false;
+var recordStartTime = null;
+var allPoints = [];          // {t, suhu, setpoint, pwm, pct, error, kp, ki, kd, vol, eff, ise, oil, water, state}
+var currentRunPoints = [];   // points since the current RUNNING started
+var pastRuns = [];           // {label, color, points}
+var runCounter = 0;
+var lastState = null;
+var runStartT0 = null;       // suhu at run start (for rise-time calc)
+var runStartSetpoint = null;
+var riseT10 = null, riseT90 = null;
+var lastOutsideBandT = null;
+var runStartMs = null;
+
+var MAX_POINTS = 50000;
+var COLORS = ["#2196F3", "#ff9800", "#8bc34a", "#9c27b0", "#00bcd4", "#f44336"];
+
+// Zoom/pan state for chart (in "index" space of currentRunPoints)
+var view = { scale: 1, offset: 0 };
+
+// ==============================================================
+// WebSocket
+// ==============================================================
+function connectWS() {
+  var ip = document.getElementById("ipInput").value.trim() || "192.168.4.1";
+  if (ws) { try { ws.close(); } catch(e){} }
+  ws = new WebSocket("ws://" + ip + ":81/");
+  document.getElementById("connMsg").textContent = "Connecting to " + ip + " ...";
+
+  ws.onopen = function() {
+    connected = true;
+    document.getElementById("liveDot").classList.add("on");
+    document.getElementById("liveText").textContent = "CONNECTED";
+    document.getElementById("connMsg").textContent = "Connected.";
+    if (document.getElementById("autoRecord").checked && !recording) toggleRecord();
+    updateStatusBar();
+  };
+  ws.onclose = function() {
+    connected = false;
+    document.getElementById("liveDot").classList.remove("on");
+    document.getElementById("liveText").textContent = "OFFLINE";
+    updateStatusBar();
+  };
+  ws.onerror = function() { document.getElementById("connMsg").textContent = "Connection error."; };
+  ws.onmessage = function(evt) {
+    var msg;
+    try { msg = JSON.parse(evt.data); } catch(e) { return; }
+    if (msg.type || msg.event) return; // ignore non-telemetry messages
+    handleTelemetry(msg);
+  };
+}
+
+// ==============================================================
+// Telemetry handling
+// ==============================================================
+function handleTelemetry(d) {
+  var now = Date.now();
+
+  document.getElementById("pState").textContent = d.state;
+  document.getElementById("pTemp").textContent = d.suhu.toFixed(1) + " °C";
+  document.getElementById("pSp").textContent = d.setpoint.toFixed(1) + " °C";
+  document.getElementById("pPwm").textContent = d.fan_pct + "%";
+  document.getElementById("pKp").textContent = d.kp.toFixed(3);
+  document.getElementById("pKi").textContent = d.ki.toFixed(4);
+  document.getElementById("pKd").textContent = d.kd.toFixed(3);
+  document.getElementById("pVol").textContent = d.volume_ml.toFixed(1) + " mL";
+  document.getElementById("pEst").textContent = (d.efficiency > 0 && d.est_finish_ms >= 0) ? fmtHMS(d.est_finish_ms) : "--";
+  document.getElementById("runBadge").textContent = "Run #" + d.run_count;
+
+  // Detect run start/end transitions
+  if (d.state === "RUNNING" && lastState !== "RUNNING") {
+    runCounter++;
+    currentRunPoints = [];
+    runStartT0 = d.suhu;
+    runStartSetpoint = d.setpoint;
+    runStartMs = now;
+    riseT10 = riseT90 = null;
+    lastOutsideBandT = now;
+    view = { scale: 1, offset: 0 };
+  }
+  if (lastState === "RUNNING" && d.state !== "RUNNING" && currentRunPoints.length > 0) {
+    var color = COLORS[(pastRuns.length) % COLORS.length];
+    pastRuns.push({ label: "Run " + d.run_count, color: color, points: currentRunPoints.slice() });
+    renderOverlayList();
+  }
+  lastState = d.state;
+
+  var point = {
+    t: now, suhu: d.suhu, setpoint: d.setpoint, pwm: d.fan_pwm, pct: d.fan_pct,
+    error: d.error, kp: d.kp, ki: d.ki, kd: d.kd, vol: d.volume_ml, eff: d.efficiency,
+    ise: d.ise, oil: d.oil_pump, water: d.water_pump, state: d.state
+  };
+
+  if (recording) {
+    allPoints.push(point);
+    if (allPoints.length > MAX_POINTS) allPoints.shift();
+  }
+  if (d.state === "RUNNING") {
+    currentRunPoints.push(point);
+
+    // Rise time tracking (10%/90% crossing of setpoint from run-start temp)
+    if (runStartT0 != null) {
+      var lo = runStartT0 + 0.1 * (runStartSetpoint - runStartT0);
+      var hi = runStartT0 + 0.9 * (runStartSetpoint - runStartT0);
+      if (riseT10 === null && d.suhu >= lo) riseT10 = now;
+      if (riseT90 === null && d.suhu >= hi) riseT90 = now;
+    }
+    // Settling band tracking (+-5% of setpoint)
+    var band = Math.abs(d.setpoint) * 0.05;
+    if (Math.abs(d.suhu - d.setpoint) > band) lastOutsideBandT = now;
+
+    updateRunStats(d);
+  }
+
+  appendLogRow(point);
+  updateStatusBar();
+  redrawChart();
+}
+
+function fmtHMS(ms) {
+  if (ms == null || ms < 0 || !isFinite(ms)) return "--";
+  var s = Math.floor(ms/1000);
+  var h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60;
+  function p(n){ return n<10 ? "0"+n : ""+n; }
+  return p(h)+":"+p(m)+":"+p(sec);
+}
+
+// ==============================================================
+// Run statistics
+// ==============================================================
+function updateRunStats(d) {
+  document.getElementById("sVol").textContent = d.volume_ml.toFixed(1) + " mL";
+  document.getElementById("sEff").textContent = d.efficiency.toFixed(1) + " mL/h";
+  document.getElementById("sIse").textContent = d.ise.toFixed(1);
+  var score = (0.6 * d.efficiency) - (0.2 * d.fan_pct) - (0.2 * d.ise / 1000);
+  document.getElementById("sScore").textContent = score.toFixed(1);
+
+  var temps = currentRunPoints.map(function(p){ return p.suhu; });
+  var n = temps.length;
+  if (n === 0) return;
+  var mean = temps.reduce(function(a,b){return a+b;},0) / n;
+  var variance = temps.reduce(function(a,b){return a+(b-mean)*(b-mean);},0) / n;
+  var std = Math.sqrt(variance);
+  var min = Math.min.apply(null, temps), max = Math.max.apply(null, temps);
+  var overshoot = runStartSetpoint ? ((max - d.setpoint) / d.setpoint * 100) : 0;
+
+  document.getElementById("sMean").textContent = mean.toFixed(1) + " °C";
+  document.getElementById("sStd").textContent = std.toFixed(2) + " °C";
+  document.getElementById("sMinMax").textContent = min.toFixed(1) + " / " + max.toFixed(1) + " °C";
+  document.getElementById("sOvershoot").textContent = overshoot.toFixed(1) + "%";
+  document.getElementById("sRise").textContent = (riseT10 && riseT90 && riseT90 >= riseT10) ? fmtHMS(riseT90 - riseT10) : "--";
+  document.getElementById("sSettle").textContent = (lastOutsideBandT && runStartMs) ? fmtHMS(lastOutsideBandT - runStartMs) : "--";
+
+  var settledPoints = currentRunPoints.filter(function(p){ return p.t >= (lastOutsideBandT || 0); });
+  if (settledPoints.length > 0) {
+    var ssErr = settledPoints.reduce(function(a,p){ return a + (p.setpoint - p.suhu); }, 0) / settledPoints.length;
+    document.getElementById("sSSErr").textContent = ssErr.toFixed(2) + " °C";
+  }
+}
+
+// ==============================================================
+// Recording controls
+// ==============================================================
+function toggleRecord() {
+  recording = !recording;
+  var btn = document.getElementById("btnRecord");
+  if (recording) {
+    recordStartTime = Date.now();
+    btn.textContent = "⏹ STOP";
+    btn.classList.remove("btn-record"); btn.classList.add("btn-stop");
+  } else {
+    btn.textContent = "⏺ RECORD";
+    btn.classList.remove("btn-stop"); btn.classList.add("btn-record");
+  }
+  updateStatusBar();
+}
+
+function updateStatusBar() {
+  var status = recording ? "RECORDING..." : "STOPPED";
+  var pts = allPoints.length;
+  var conn = connected ? "🟢 Connected" : "🔴 Disconnected";
+  document.getElementById("statusBar").textContent =
+    "Status: " + status + " | " + pts + " titik | Koneksi: " + conn +
+    (recordStartTime ? " | Mulai: " + new Date(recordStartTime).toLocaleTimeString() : "");
+}
+
+// ==============================================================
+// Data log table (last 500 rows, auto-scroll)
+// ==============================================================
+function appendLogRow(p) {
+  var body = document.getElementById("logBody");
+  var tr = document.createElement("tr");
+  var elapsed = recordStartTime ? (p.t - recordStartTime) : 0;
+  tr.innerHTML = "<td class='mono'>" + fmtHMS(elapsed) + "</td><td class='mono'>" + p.suhu.toFixed(1) +
+                 "</td><td class='mono'>" + p.setpoint.toFixed(1) + "</td><td class='mono'>" + p.pct +
+                 "%</td><td class='mono'>" + p.vol.toFixed(1) + "</td><td class='mono'>" + p.ise.toFixed(0) + "</td>";
+  body.appendChild(tr);
+  while (body.children.length > 500) body.removeChild(body.firstChild);
+  var scroller = document.getElementById("tableScroll");
+  scroller.scrollTop = scroller.scrollHeight;
+}
+
+// ==============================================================
+// Export
+// ==============================================================
+function timestampName() {
+  var now = new Date();
+  function p(n){ return n<10 ? "0"+n : ""+n; }
+  return now.getFullYear()+"-"+p(now.getMonth()+1)+"-"+p(now.getDate())+"_"+p(now.getHours())+"-"+p(now.getMinutes())+"-"+p(now.getSeconds());
+}
+
+function downloadBlob(content, mime, filename) {
+  var blob = new Blob([content], {type: mime});
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement("a");
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function exportCSV() {
+  var header = "timestamp_ms,elapsed_s,suhu_c,setpoint_c,fan_pwm,fan_pct,error,kp,ki,kd,volume_ml,efficiency_ml_h,ise,oil_pump,water_pump,state\n";
+  var t0 = allPoints.length ? allPoints[0].t : Date.now();
+  var rows = allPoints.map(function(p) {
+    return [p.t, ((p.t - t0)/1000).toFixed(1), p.suhu, p.setpoint, p.pwm, p.pct, p.error,
+            p.kp, p.ki, p.kd, p.vol, p.eff, p.ise, p.oil, p.water, p.state].join(",");
+  }).join("\n");
+  downloadBlob(header + rows, "text/csv", "pyrolysis_run_" + timestampName() + ".csv");
+}
+
+function exportJSON() {
+  var last = allPoints[allPoints.length - 1] || {};
+  var first = allPoints[0] || {};
+  var meta = {
+    tanggal: new Date().toISOString().slice(0,10),
+    run_count: runCounter,
+    setpoint: last.setpoint || 0,
+    target_volume: null,
+    durasi_ms: (last.t && first.t) ? (last.t - first.t) : 0,
+    total_volume_ml: last.vol || 0,
+    efficiency_ml_h: last.eff || 0,
+    final_kp: last.kp || 0,
+    final_ki: last.ki || 0,
+    final_kd: last.kd || 0,
+    ise_final: last.ise || 0,
+    score: (0.6*(last.eff||0)) - (0.2*(last.pct||0)) - (0.2*(last.ise||0)/1000)
+  };
+  var out = { metadata: meta, data: allPoints };
+  downloadBlob(JSON.stringify(out, null, 2), "application/json", "pyrolysis_run_" + timestampName() + ".json");
+}
+
+// ==============================================================
+// Interactive canvas chart (zoom via wheel, pan via drag, click tooltip)
+// ==============================================================
+function resetZoom() { view = { scale: 1, offset: 0 }; redrawChart(); }
+
+function getVisiblePoints() {
+  var pts = currentRunPoints.length ? currentRunPoints : allPoints.slice(-500);
+  var n = pts.length;
+  if (n === 0) return [];
+  var visibleCount = Math.max(2, Math.floor(n / view.scale));
+  var start = Math.min(n - visibleCount, Math.max(0, Math.floor(view.offset)));
+  return pts.slice(start, start + visibleCount);
+}
+
+function redrawChart() {
+  var canvas = document.getElementById("mainChart");
+  var ctx = canvas.getContext("2d");
+  var w = canvas.width, h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+
+  var padL = 45, padR = 15, padT = 15, padB = 30;
+  var plotW = w - padL - padR, plotH = h - padT - padB;
+
+  var showSuhu = document.getElementById("serSuhu").checked;
+  var showSp = document.getElementById("serSp").checked;
+  var showPwm = document.getElementById("serPwm").checked;
+
+  var pts = getVisiblePoints();
+
+  ctx.strokeStyle = "#e0e0e0"; ctx.lineWidth = 1; ctx.font = "10px monospace"; ctx.fillStyle = "#757575";
+  for (var i = 0; i <= 4; i++) {
+    var y = padT + (plotH/4)*i;
+    ctx.beginPath(); ctx.moveTo(padL,y); ctx.lineTo(w-padR,y); ctx.stroke();
+    ctx.fillText((800 - (800/4)*i).toFixed(0), 2, y+3);
+  }
+
+  function drawSeries(points, key, color, maxV) {
+    if (points.length < 2) return;
+    ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.beginPath();
+    points.forEach(function(p, i) {
+      var x = padL + (i/(points.length-1)) * plotW;
+      var v = Math.max(0, Math.min(maxV, p[key]));
+      var y = padT + plotH - (v/maxV)*plotH;
+      if (i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    });
+    ctx.stroke();
+  }
+
+  // Past run overlays (only when their checkbox is checked)
+  pastRuns.forEach(function(run, idx) {
+    var cb = document.getElementById("overlayCb" + idx);
+    if (cb && cb.checked) drawSeries(run.points, "suhu", run.color + "88", 800);
+  });
+
+  if (showSuhu) drawSeries(pts, "suhu", "#2196F3", 800);
+  if (showSp) drawSeries(pts, "setpoint", "#e53935", 800);
+  if (showPwm) drawSeries(pts, "pct", "#8bc34a", 100);
+
+  window._chartPts = pts;
+  window._chartPadL = padL; window._chartPadT = padT; window._chartPlotW = plotW; window._chartPlotH = plotH;
+}
+
+function renderOverlayList() {
+  var container = document.getElementById("overlayList");
+  container.innerHTML = pastRuns.map(function(run, idx) {
+    return '<label style="color:' + run.color + ';"><input type="checkbox" id="overlayCb' + idx +
+           '" onchange="redrawChart()"> ' + run.label + '</label>';
+  }).join(" ");
+}
+
+(function setupChartInteraction() {
+  var canvas = document.getElementById("mainChart");
+  var dragging = false, dragStartX = 0, dragStartOffset = 0;
+
+  canvas.addEventListener("wheel", function(e) {
+    e.preventDefault();
+    var factor = e.deltaY < 0 ? 1.15 : 1/1.15;
+    view.scale = Math.max(1, Math.min(50, view.scale * factor));
+    redrawChart();
+  }, { passive: false });
+
+  canvas.addEventListener("mousedown", function(e) {
+    dragging = true; dragStartX = e.clientX; dragStartOffset = view.offset;
+    canvas.style.cursor = "grabbing";
+  });
+  window.addEventListener("mouseup", function() { dragging = false; canvas.style.cursor = "grab"; });
+  canvas.addEventListener("mousemove", function(e) {
+    if (dragging) {
+      var pts = currentRunPoints.length ? currentRunPoints : allPoints;
+      var n = pts.length || 1;
+      var visibleCount = Math.max(2, Math.floor(n / view.scale));
+      var dx = e.clientX - dragStartX;
+      var pointsPerPixel = visibleCount / (window._chartPlotW || 1);
+      view.offset = Math.max(0, Math.min(n - visibleCount, dragStartOffset - dx * pointsPerPixel));
+      redrawChart();
+      return;
+    }
+    // Hover tooltip
+    var rect = canvas.getBoundingClientRect();
+    var mx = e.clientX - rect.left, my = e.clientY - rect.top;
+    var pts = window._chartPts || [];
+    if (pts.length < 1) return;
+    var padL = window._chartPadL, plotW = window._chartPlotW;
+    var idx = Math.round(((mx - padL) / plotW) * (pts.length - 1));
+    idx = Math.max(0, Math.min(pts.length - 1, idx));
+    var p = pts[idx];
+    if (!p || mx < padL || mx > padL + plotW) { document.getElementById("tooltip").style.display = "none"; return; }
+    var tip = document.getElementById("tooltip");
+    tip.style.display = "block";
+    tip.style.left = (e.clientX + 12) + "px";
+    tip.style.top = (e.clientY + 12) + "px";
+    tip.innerHTML = "Suhu: " + p.suhu.toFixed(1) + "&deg;C<br>SP: " + p.setpoint.toFixed(1) +
+                     "&deg;C<br>PWM: " + p.pct + "%<br>Vol: " + p.vol.toFixed(1) + " mL";
+  });
+  canvas.addEventListener("mouseleave", function() { document.getElementById("tooltip").style.display = "none"; });
+})();
+
+updateStatusBar();
+redrawChart();
+</script>
+</body>
+</html>
