@@ -1,0 +1,13 @@
+Cara ambil datanya, lengkap:
+
+Sambungkan WiFi laptop ke Pyrolysis-Diag (password 12345678).
+Buka dua hal sekaligus:
+Terminal: python logger.py log (biarkan tetap jalan, jangan ditutup) — atau python logger.py log --plot kalau mau lihat grafik langsung.
+Browser: http://192.168.4.1 — dashboard-nya.
+Dari dashboard, jalankan test yang mau diuji (Step Test / Relay Test / Uji Metode) dengan parameter yang Anda mau.
+Selama berjalan, terminal logger.py akan menampilkan suhu/fan/mode setiap detik dan menyimpan semuanya ke data/log_<waktu>.csv — sekarang termasuk kolom kp,ki,kd,zone kalau yang jalan Uji Metode.
+Begitu test selesai (kembali ke idle), logger.py otomatis mengunduh dan menyimpan hasilnya — tidak perlu perintah tambahan:
+Step Test → result_step_*.json + step_*.csv
+Relay Test → result_relay_*.json
+Uji Metode → result_method_*.json + method_*.csv (daftar waktu tiap tetes)
+Kalau mau, Ctrl+C untuk berhenti mencatat kapan saja — data yang sudah tersimpan tidak hilang.
