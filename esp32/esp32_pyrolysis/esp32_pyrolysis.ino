@@ -218,6 +218,14 @@ static float         atFiltTemp     = 0;       // suhu terfilter (EMA) untuk rel
 static unsigned long atStartMs      = 0;
 static uint8_t       atBadReads     = 0;
 static const char   *atError        = "";      // alasan batal (kosong = tidak ada)
+static char           atErrorBuf[160];          // buffer utk pesan error yang dibentuk dinamis
+
+// Amplitudo osilasi minimal (degC) supaya hasil Ku/Kp/Ki/Kd dipercaya. Di
+// bawah ini, amplitudo sudah terlalu dekat dengan histeresis deteksi puncak
+// (AT_PEAK_BAND=1C) sehingga Ku = 4d/(pi*a) bisa meledak jadi puluhan kali
+// lipat terlalu besar -- PID jadi saturasi hampir selalu (perilaku bang-bang,
+// bukan PID halus) walau tampak "berhasil" selesai tanpa error.
+#define AT_MIN_AMPLITUDE  3.0f
 
 // Hasil autotune
 static float resultKu = 0, resultTu = 0;
@@ -319,6 +327,18 @@ void autotuneFinish() {
   }
   if (a <= 0.0f || Tu <= 0.0f) {
     autotuneAbort("amplitude/period osilasi tidak valid");
+    return;
+  }
+  // Tolak bila amplitudo terlalu kecil -- Ku=4d/(pi*a) akan meledak dan
+  // menghasilkan Kp/Ki/Kd yang membuat PID berperilaku bang-bang (saturasi
+  // hampir selalu), bukan PID yang halus. Biasanya terjadi kalau setpoint
+  // tuning terlalu dekat suhu ambient/osilasi belum sempat terbentuk bersih.
+  if (a < AT_MIN_AMPLITUDE) {
+    snprintf(atErrorBuf, sizeof(atErrorBuf),
+      "osilasi suhu terlalu kecil untuk dipercaya (a=%.2f C, minimal %.1f C) -- "
+      "coba setpoint tuning lebih tinggi (mendekati kondisi operasi nyata) "
+      "atau naikkan Fan ON (%%)", a, AT_MIN_AMPLITUDE);
+    autotuneAbort(atErrorBuf);
     return;
   }
 
@@ -650,6 +670,15 @@ void stepProcess(float raw) {
 #define MT_ZONE_COLD_MAX  200.0f
 #define MT_ZONE_MID_MAX   400.0f
 
+// Filter EMA (exponential moving average) pada suhu SEBELUM dipakai PID
+// (error, gain scheduling, derivative) -- meredam noise/kuantisasi sensor
+// MAX6675 (+-0.25 C per langkah) supaya tidak memicu lonjakan derivative
+// yang tidak perlu. Alpha sama dengan yang dipakai Relay Test (AT_FILTER_
+// ALPHA) supaya konsisten. CATATAN: ini meredam NOISE, bukan osilasi besar
+// akibat gain PID yang salah -- itu diatasi lewat validasi amplitudo di
+// Relay Test (AT_MIN_AMPLITUDE) dan tombol Reset PID, bukan di sini.
+#define MT_FILTER_ALPHA   0.2f
+
 static bool          mtActive       = false;
 static bool          mtDone         = false;
 static const char   *mtError        = "";
@@ -660,7 +689,8 @@ static float         mtInteg        = 0;
 static float         mtPrevErr      = 0;
 static bool          mtFirstSample  = true;
 static uint8_t       mtBadReads     = 0;
-static float         mtLastTemp     = 0;
+static float         mtLastTemp     = 0;      // suhu MENTAH (untuk tampilan & pengaman overtemp)
+static float         mtFiltTemp     = 0;      // suhu terfilter EMA (dipakai PID)
 static uint8_t       mtLastFanPct   = 0;
 static float         mtLastKp = 0, mtLastKi = 0, mtLastKd = 0;   // Kp/Ki/Kd AKTIF (setelah gain schedule)
 static const char   *mtLastZone     = "-";    // "cold" / "mid" / "hot"
@@ -704,6 +734,7 @@ void methodTestStart(float setpoint, int maxMin) {
   mtSampleN     = 0;
   mtLastKp = mtLastKi = mtLastKd = 0;
   mtLastZone    = "-";
+  mtFiltTemp    = 0;
 
   noInterrupts();
   mtTipCountBase = tipCount;
@@ -748,6 +779,7 @@ static void mtFinish() {
 
 // Dipanggil dari loop() setiap 1 detik saat mtActive = true
 void methodTestProcess(float raw) {
+  // Pengaman overtemp pakai suhu MENTAH supaya tidak tertunda filter
   if (raw > mtSetpoint + AT_OVERTEMP_MARGIN) {
     mtAbort("suhu melebihi batas aman (setpoint + 100 C)");
     return;
@@ -757,10 +789,15 @@ void methodTestProcess(float raw) {
 
   mtLastTemp = raw;
 
-  float kp, ki, kd;
-  mtApplyGainSchedule(raw, kp, ki, kd);
+  // Filter EMA sebelum dipakai PID (lihat catatan MT_FILTER_ALPHA)
+  if (mtFirstSample) mtFiltTemp = raw;
+  else                mtFiltTemp += MT_FILTER_ALPHA * (raw - mtFiltTemp);
+  float meas = mtFiltTemp;
 
-  float err = mtSetpoint - raw;
+  float kp, ki, kd;
+  mtApplyGainSchedule(meas, kp, ki, kd);
+
+  float err = mtSetpoint - meas;
 
   mtInteg += ki * err;                  // dt = 1 detik (AT_SAMPLE_MS), tersirat *dt=1
   if (mtInteg > MT_I_MAX) mtInteg = MT_I_MAX;
@@ -1168,6 +1205,19 @@ static void handlePidApply() {
   sendPidJson("applied");
 }
 
+// GET /pid/reset -> kembalikan Kp/Ki/Kd ke default pabrik (2.0/0.1/10.0)
+static void handlePidReset() {
+  if (mtActive) {
+    sendJson(F("{\"type\":\"PID\",\"status\":\"error\",\"error\":\"uji metode sedang memakai gain ini, stop dulu\"}"), 409);
+    return;
+  }
+  pidKp = 2.0f; pidKi = 0.1f; pidKd = 10.0f;
+  pidSource = 0;
+  pidSave();
+  Serial.println(F("[PID] Direset ke default: Kp=2.0 Ki=0.1 Kd=10.0"));
+  sendPidJson("reset");
+}
+
 // GET /pid/get
 static void handlePidGet() {
   sendPidJson("ok");
@@ -1542,7 +1592,10 @@ const char HTML[] PROGMEM = R"HTMLDIAG(
     <button class="primary" id="btnAtApply" onclick="pidApply()">TERAPKAN KE PID</button>
   </div>
   <div class="status-line">PID aktif: <b id="pidActive">--</b></div>
-  <div class="hint">Autotune berjalan ~3-10 menit tergantung thermal mass sistem. Jangan ubah setpoint atau matikan power saat proses berjalan. Hasil Kp/Ki/Kd ini adalah nilai AWAL untuk PID adaptive &mdash; gain scheduling akan menyesuaikan otomatis saat sistem berjalan. Mulai dari suhu di bawah setpoint (tungku dingin) supaya osilasi pertama valid. Saat Relay/Step Test aktif, kontrol fan manual dan Test Semua dikunci. Satuan hasil: % PWM fan per &deg;C. "Terapkan ke PID" menyimpan Kp/Ki/Kd ke memori ESP32 (NVS, tetap ada setelah reboot).</div>
+  <div class="btn-row">
+    <button class="danger" id="btnPidReset" onclick="pidReset()" style="width:100%;">RESET PID KE DEFAULT (Kp=2.0 Ki=0.1 Kd=10.0)</button>
+  </div>
+  <div class="hint">Autotune berjalan ~3-10 menit tergantung thermal mass sistem. Jangan ubah setpoint atau matikan power saat proses berjalan. Hasil Kp/Ki/Kd ini adalah nilai AWAL untuk PID adaptive &mdash; gain scheduling akan menyesuaikan otomatis saat sistem berjalan. Mulai dari suhu di bawah setpoint (tungku dingin) supaya osilasi pertama valid, dan sebaiknya DEKAT suhu operasi nyata (bukan 60 C kalau target akhirnya 300 C) supaya amplitudo osilasi cukup besar untuk hasil yang andal. Saat Relay/Step/Uji Metode aktif, kontrol fan manual dan Test Semua dikunci. Satuan hasil: % PWM fan per &deg;C. "Terapkan ke PID" menyimpan Kp/Ki/Kd ke memori ESP32 (NVS, tetap ada setelah reboot); "Reset PID" mengembalikannya ke default kapan saja.</div>
 </div>
 
 <!-- 9. Uji Metode -->
@@ -1817,8 +1870,13 @@ function pidApply() {
   req("/pid/apply");
 }
 
+function pidReset() {
+  if (!confirm("Reset Kp/Ki/Kd ke default (Kp=2.0 Ki=0.1 Kd=10.0)? Nilai hasil Relay Test yang tersimpan sekarang akan hilang.")) return;
+  req("/pid/reset");
+}
+
 function pidHandle(d) {
-  if (d.status === "error") { alert("Gagal menerapkan: " + d.error); return; }
+  if (d.status === "error") { alert("Gagal: " + d.error); return; }
   document.getElementById("pidActive").textContent =
     "Kp=" + d.Kp.toFixed(4) + " Ki=" + d.Ki.toFixed(4) + " Kd=" + d.Kd.toFixed(4) +
     " (" + (d.src === "relay" ? "hasil relay test" : "default") + ")";
@@ -1826,6 +1884,10 @@ function pidHandle(d) {
     var b = document.getElementById("btnAtApply");
     b.textContent = "DITERAPKAN";
     setTimeout(function(){ b.textContent = "TERAPKAN KE PID"; }, 1500);
+  } else if (d.status === "reset") {
+    var rb = document.getElementById("btnPidReset");
+    rb.textContent = "SUDAH DI-RESET";
+    setTimeout(function(){ rb.textContent = "RESET PID KE DEFAULT (Kp=2.0 Ki=0.1 Kd=10.0)"; }, 1500);
   }
 }
 
@@ -2162,6 +2224,7 @@ void setup() {
   server.on("/step/stop", handleStStop);
   server.on("/step/status", handleStStatus);
   server.on("/pid/apply", handlePidApply);
+  server.on("/pid/reset", handlePidReset);
   server.on("/pid/get", handlePidGet);
   server.on("/temp/auto", handleTempAuto);
   server.on("/data/live", handleDataLive);

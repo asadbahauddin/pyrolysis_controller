@@ -45,6 +45,21 @@ def http_get(host, path, timeout=3.0):
         return resp.read().decode("utf-8", errors="replace")
 
 
+def gui_sleep(seconds, plot):
+    """time.sleep() yang tetap memompa event loop Tk/matplotlib supaya window
+    grafik tidak dianggap Windows sebagai "Not Responding" saat menunggu
+    (dipakai terutama saat koneksi ESP32 putus-nyambung dan logger retry)."""
+    if not plot or seconds <= 0:
+        time.sleep(max(seconds, 0))
+        return
+    end = time.time() + seconds
+    while True:
+        remaining = end - time.time()
+        if remaining <= 0:
+            break
+        plot.plt.pause(min(0.1, remaining))
+
+
 def get_json(host, path, timeout=3.0):
     return json.loads(http_get(host, path, timeout))
 
@@ -167,11 +182,11 @@ def cmd_log(args):
             while args.count == 0 or n < args.count:
                 loop_start = time.time()
                 try:
-                    d = get_json(args.host, "/data/live")
+                    d = get_json(args.host, "/data/live", timeout=2.0)
                 except (OSError, urllib.error.URLError, ValueError) as e:
                     lost += 1
                     print("\r[!] tidak ada respons dari ESP32 (%dx): %s        " % (lost, e), end="")
-                    time.sleep(args.interval)
+                    gui_sleep(args.interval, plot)
                     continue
                 if lost:
                     print("\n[OK] koneksi pulih setelah %d percobaan gagal" % lost)
@@ -201,8 +216,7 @@ def cmd_log(args):
                 prev_mode = mode
 
                 delay = args.interval - (time.time() - loop_start)
-                if delay > 0:
-                    time.sleep(delay)
+                gui_sleep(delay, plot)
         except KeyboardInterrupt:
             print("\nDihentikan.")
     print("%d baris tersimpan di %s" % (n, csv_path))
