@@ -8,10 +8,15 @@ Cara pakai:
         Password : 12345678        (ESP32 = 192.168.4.1)
      Laptop tidak butuh internet.
   2. Jalankan:
-        python logger.py log                # catat data live ke CSV (Ctrl+C untuk berhenti)
-        python logger.py log --plot         # + grafik suhu/fan langsung (butuh matplotlib)
+        python logger.py log                # catat data live ke CSV + grafik langsung
+                                              # (grafik otomatis, butuh matplotlib)
+        python logger.py log --no-plot      # tanpa grafik (cuma teks+CSV)
         python logger.py step-data          # unduh seluruh rekaman Step Test terakhir dari ESP32
         python logger.py status             # cek koneksi, tampilkan satu paket data
+
+Grafik (subplot atas) menampilkan suhu DAN garis putus-putus setpoint yang
+sedang aktif (kosong saat idle) -- dipakai untuk melihat sekilas overshoot
+dan settling time selama Uji Metode berjalan.
 
 Saat `log` berjalan dan Anda menjalankan Step Test / Relay Test / Uji Metode
 dari dashboard (http://192.168.4.1), logger otomatis menyimpan HASIL uji itu
@@ -19,8 +24,13 @@ begitu selesai (baik karena sukses, distop manual, maupun gagal):
   data/result_step_<waktu>.json    + data/step_<waktu>.csv    (rekaman penuh)
   data/result_relay_<waktu>.json
   data/result_method_<waktu>.json  + data/method_<waktu>.csv  (waktu tetes)
+Untuk Uji Metode, logger JUGA menghitung sendiri overshoot (%) dan settling
+time (detik, band +-2% sekitar setpoint) dari data yang baru dicatat, dan
+mencetaknya ke layar -- overshoot/settling time cuma relevan untuk Uji
+Metode (closed-loop mengejar setpoint), bukan Step/Relay Test.
 
-Hanya memakai library standar Python 3 (matplotlib opsional).
+Hanya memakai library standar Python 3 (matplotlib opsional -- tanpanya,
+logger tetap jalan penuh, cuma tanpa grafik).
 """
 import argparse
 import csv
@@ -66,6 +76,25 @@ def get_json(host, path, timeout=3.0):
 
 def stamp():
     return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def compute_overshoot_settling(times, temps, sp, t0_temp):
+    """Overshoot (%) & settling time (detik, band +-2% sekitar sp) dari satu
+    segmen Uji Metode. t0_temp = suhu di awal segmen (dipakai sbg baseline,
+    sama seperti compute_response_metrics.m di simulasi MATLAB)."""
+    if not temps or sp is None:
+        return None, None
+    span = sp - t0_temp
+    if span == 0:
+        return None, None
+    peak = max(temps) if span > 0 else min(temps)
+    overshoot = max(0.0, (peak - sp) / abs(span) * 100.0) if span > 0 else max(0.0, (sp - peak) / abs(span) * 100.0)
+    band = 0.02 * max(abs(sp), 1.0)
+    settle_t = times[0]
+    for t, v in zip(times, temps):
+        if abs(v - sp) > band:
+            settle_t = t
+    return overshoot, settle_t
 
 
 def save_finished_test(host, out_dir, kind):
@@ -133,27 +162,42 @@ class LivePlot:
     def __init__(self, window_s=1800):
         import matplotlib.pyplot as plt  # ImportError ditangani pemanggil
         self.plt = plt
-        self.t = deque(); self.temp = deque(); self.fan = deque()
+        self.t = deque(); self.temp = deque(); self.fan = deque(); self.sp = deque()
         self.window = window_s
         plt.ion()
         self.fig, (self.ax1, self.ax2) = plt.subplots(2, 1, sharex=True, figsize=(9, 6))
-        self.l1, = self.ax1.plot([], [], "g-")
-        self.l2, = self.ax2.plot([], [], "b-")
+        self.l1, = self.ax1.plot([], [], "g-", linewidth=1.5, label="Suhu")
+        self.lsp, = self.ax1.plot([], [], "k--", linewidth=1.2, label="Setpoint")
+        self.l2, = self.ax2.plot([], [], "b-", linewidth=1.2)
         self.ax1.set_ylabel("Suhu (C)"); self.ax2.set_ylabel("Fan (%)")
         self.ax2.set_xlabel("Waktu (s)"); self.ax2.set_ylim(-5, 105)
+        self.ax1.legend(loc="upper left", fontsize=9)
         for ax in (self.ax1, self.ax2):
             ax.grid(True)
         self.fig.suptitle("ESP32 Pyrolysis - data live")
 
-    def add(self, t, temp, fan):
+    def add(self, t, temp, fan, sp=None):
+        # sp<=0 berarti idle (tidak ada uji aktif) -> putus garis (NaN), bukan nyambung ke 0
         self.t.append(t); self.temp.append(temp); self.fan.append(fan)
+        self.sp.append(sp if sp else float("nan"))
         while self.t and t - self.t[0] > self.window:
-            self.t.popleft(); self.temp.popleft(); self.fan.popleft()
+            self.t.popleft(); self.temp.popleft(); self.fan.popleft(); self.sp.popleft()
         pts = [(a, b) for a, b in zip(self.t, self.temp) if b is not None]
         self.l1.set_data([p[0] for p in pts], [p[1] for p in pts])
+        self.lsp.set_data(list(self.t), list(self.sp))
         self.l2.set_data(list(self.t), list(self.fan))
         self.ax1.relim(); self.ax1.autoscale_view()
         self.ax2.set_xlim(self.t[0], max(self.t[-1], self.t[0] + 60))
+        self.plt.pause(0.001)
+
+    def annotate(self, text):
+        """Tampilkan kotak teks hasil (overshoot/settling) di pojok grafik suhu."""
+        if hasattr(self, "_annot"):
+            self._annot.remove()
+        self._annot = self.ax1.text(
+            0.99, 0.02, text, transform=self.ax1.transAxes, fontsize=9,
+            ha="right", va="bottom",
+            bbox=dict(boxstyle="round", facecolor="lightyellow", edgecolor="black"))
         self.plt.pause(0.001)
 
 
@@ -162,16 +206,17 @@ def cmd_log(args):
     csv_path = os.path.join(args.out_dir, "log_%s.csv" % stamp())
 
     plot = None
-    if args.plot:
+    if not args.no_plot:
         try:
             plot = LivePlot()
         except ImportError:
-            print("matplotlib tidak terpasang -> grafik dimatikan (pip install matplotlib)")
+            print("matplotlib tidak terpasang -> grafik dimatikan (pip install matplotlib untuk mengaktifkan)")
 
     print("Menghubungi ESP32 di %s ... (Ctrl+C untuk berhenti)" % args.host)
     print("Menyimpan ke: %s\n" % csv_path)
 
     prev_mode = "idle"
+    method_seg = None   # {"times":[], "temps":[], "sp":..} selama mode=="method"
     lost = 0
     n = 0
     t0 = time.time()
@@ -202,17 +247,41 @@ def cmd_log(args):
                 n += 1
 
                 temp = d.get("temp")
+                sp = d.get("sp")
                 print("%s  %-5s  T=%s C  fan=%3s%%  oil=%s water=%s tips=%s" % (
                     now.strftime("%H:%M:%S"), d.get("mode"),
                     ("%7.2f" % temp) if temp is not None else "   ERR ",
                     d.get("fan"), d.get("oil"), d.get("water"), d.get("tips")))
 
+                t_rel = time.time() - t0
                 if plot:
-                    plot.add(time.time() - t0, temp, d.get("fan") or 0)
+                    plot.add(t_rel, temp, d.get("fan") or 0, sp)
 
                 mode = d.get("mode", "idle")
+
+                # Lacak segmen Uji Metode berjalan supaya bisa hitung overshoot/settling
+                # time sendiri dari data yang baru dicatat (lepas dari ringkasan ESP32).
+                if mode == "method":
+                    if method_seg is None:
+                        method_seg = {"t_ref": t_rel, "times": [], "temps": [], "sp": sp}
+                    method_seg["times"].append(t_rel - method_seg["t_ref"])
+                    if temp is not None:
+                        method_seg["temps"].append(temp)
+                    if sp:
+                        method_seg["sp"] = sp
+
                 if prev_mode in ("step", "relay", "method") and mode == "idle":
                     save_finished_test(args.host, args.out_dir, prev_mode)
+                    if prev_mode == "method" and method_seg and method_seg["temps"]:
+                        ov, settl = compute_overshoot_settling(
+                            method_seg["times"], method_seg["temps"],
+                            method_seg["sp"], method_seg["temps"][0])
+                        if ov is not None:
+                            txt = "Overshoot=%.1f%%  Settling=%.0fs  (sp=%.1fC)" % (ov, settl, method_seg["sp"])
+                            print("  perkiraan dari log      : %s" % txt)
+                            if plot:
+                                plot.annotate(txt)
+                    method_seg = None
                 prev_mode = mode
 
                 delay = args.interval - (time.time() - loop_start)
@@ -256,7 +325,7 @@ def main():
     p.add_argument("--interval", type=float, default=1.0, help="detik antar pembacaan (default 1.0)")
     p.add_argument("--out-dir", default="data", help="folder keluaran (default ./data)")
     p.add_argument("--out", help="nama file keluaran (khusus step-data)")
-    p.add_argument("--plot", action="store_true", help="grafik langsung (butuh matplotlib)")
+    p.add_argument("--no-plot", action="store_true", help="matikan grafik langsung (default: aktif kalau matplotlib ada)")
     p.add_argument("--count", type=int, default=0, help="berhenti setelah N sampel (0 = tanpa batas)")
     args = p.parse_args()
 
