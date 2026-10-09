@@ -17,31 +17,32 @@ Cara pakai:
 
 Definisi metrik:
   SP            = setpoint segmen (nilai sp yang paling sering muncul)
-  T0            = suhu di awal segmen (baseline)
-  Tss           = rata-rata suhu 10% sampel TERAKHIR (steady state)
-  Overshoot     = (Tpeak - SP) / SP x 100%
-                  (dicetak JUGA versi (Tpeak-SP)/(SP-T0) x 100% -- definisi
-                  klasik buku teks kontrol, dibagi rentang kenaikan bukan
-                  nilai SP itu sendiri; dua angka ini bisa beda kalau T0
-                  bukan ~0, mis. mulai dari tungku masih hangat)
+  T0            = suhu awal = rata-rata 10 sampel PERTAMA
+  Tpeak         = suhu maksimum (raw) selama segmen
+  Overshoot     = (Tpeak - SP) / SP x 100% (0% kalau Tpeak <= SP)
   Rise Time     = waktu dari 10% ke 90% dari (SP - T0)
-  Settling Time = waktu TERAKHIR suhu (versi dihaluskan rolling average,
-                  bukan mentah) keluar dari band +-5% sekitar SP (setelah
-                  titik itu, suhu tetap di dalam band). Pakai versi halus
-                  supaya noise sensor MAX6675 sesaat (lonjakan 1-2 sampel)
-                  tidak dihitung sebagai "belum settle" -- itu noise, bukan
-                  osilasi kontrol beneran.
+  Settling Time = waktu PERTAMA KALI suhu (versi dihaluskan rolling average,
+                  default 10 sampel) MASUK dan TETAP dalam band +-5% SP.
+                  Pakai versi halus supaya noise sensor MAX6675 sesaat
+                  (lonjakan 1-2 sampel) tidak dihitung sebagai "belum
+                  settle" -- itu noise, bukan osilasi kontrol beneran.
+  Tss           = rata-rata suhu (raw) dari titik settled sampai akhir data
+                  (fallback: rata-rata 10% sampel terakhir, kalau belum
+                  pernah settle sampai akhir segmen)
   SS Error      = |SP - Tss|
 
-Grafik (PNG) menampilkan suhu mentah (tipis) dan versi dihaluskan rolling
-average (tebal). Overshoot/Rise Time/Tss dihitung dari data MENTAH (kolom
-temp_c); Settling Time dihitung dari versi halus (lihat di atas).
+Grafik (PNG) menampilkan suhu mentah (abu-abu tipis transparan) dan versi
+dihaluskan rolling average (merah tebal), plus pita toleransi +-5% SP
+(hijau transparan). Overshoot/Rise Time dihitung dari data MENTAH; Settling
+Time/Tss dihitung dari versi halus (lihat di atas). Skrip juga menyimpan
+PNG kedua berisi tabel ringkasan hasil ("<csv>_hasil_pid.png").
 
 Butuh: pandas, matplotlib (pip install pandas matplotlib).
 """
 import argparse
 import sys
 
+import numpy as np
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")  # aman dipakai tanpa layar; skrip ini cuma menyimpan PNG
@@ -115,7 +116,7 @@ def find_segments(df, mode_filter):
     return segs
 
 
-def compute_metrics(seg_df, band_frac, smooth_window=5):
+def compute_metrics(seg_df, band_frac, smooth_window=10):
     seg_df = seg_df.reset_index(drop=True)
     t = (seg_df["t"] - seg_df["t"].iloc[0]).to_numpy()
     temp = seg_df["temp"].to_numpy()
@@ -126,13 +127,12 @@ def compute_metrics(seg_df, band_frac, smooth_window=5):
         raise SystemExit("Segmen ini tidak punya nilai setpoint (sp) yang valid -- cek --mode/--run.")
     sp = float(sp_counts.mode().iloc[0])
 
-    T0 = float(temp[0])
-    n_tail = max(1, int(round(0.1 * len(temp))))
-    Tss = float(pd.Series(temp[-n_tail:]).mean())
+    n_head = max(1, min(10, len(temp)))
+    T0 = float(pd.Series(temp[:n_head]).mean())
     span = sp - T0
 
     rising = span > 0
-    Tpeak = float(temp.max() if rising else temp.min())
+    Tpeak = float(np.nanmax(temp) if rising else np.nanmin(temp))
     overshoot_sp = max(0.0, (Tpeak - sp) / sp * 100.0) if (rising and sp != 0) else \
         (max(0.0, (sp - Tpeak) / sp * 100.0) if sp != 0 else float("nan"))
     overshoot_span = max(0.0, (Tpeak - sp) / span * 100.0) if rising else \
@@ -150,44 +150,54 @@ def compute_metrics(seg_df, band_frac, smooth_window=5):
 
     band = band_frac * abs(sp)
     outside = [i for i, v in enumerate(temp_smooth) if abs(v - sp) > band]
+    never_settled = bool(outside) and outside[-1] + 1 >= len(t)
     if not outside:
-        settling_time = t[0]       # sudah di dalam band sejak awal segmen
+        settle_idx = 0              # sudah di dalam band sejak awal segmen
     elif outside[-1] + 1 < len(t):
-        settling_time = t[outside[-1] + 1]
+        settle_idx = outside[-1] + 1
     else:
-        settling_time = t[-1]      # tidak pernah settle sampai segmen berakhir
+        settle_idx = len(t) - 1     # tidak pernah settle sampai segmen berakhir
+    settling_time = t[settle_idx]
 
+    if never_settled:
+        n_tail = max(1, int(round(0.1 * len(temp))))
+        Tss = float(pd.Series(temp[-n_tail:]).mean())
+    else:
+        Tss = float(pd.Series(temp[settle_idx:]).mean())
     sse = abs(sp - Tss)
 
     return {
         "SP": sp, "T0": T0, "Tss": Tss, "Tpeak": Tpeak,
         "overshoot_sp": overshoot_sp, "overshoot_span": overshoot_span,
         "rise_time": rise_time, "settling_time": settling_time,
-        "never_settled": bool(outside) and outside[-1] + 1 >= len(t),
-        "sse": sse, "band_pct": band_frac * 100, "i10": i10, "i90": i90,
-        "t": t, "temp": temp, "rising": rising,
+        "settle_idx": settle_idx, "never_settled": never_settled,
+        "sse": sse, "band_pct": band_frac * 100, "band": band,
+        "i10": i10, "i90": i90,
+        "t": t, "temp": temp, "temp_smooth": temp_smooth, "rising": rising,
     }
 
 
 def plot_result(m, out_path, smooth_window):
-    t, temp = m["t"], m["temp"]
-    temp_smooth = pd.Series(temp).rolling(smooth_window, min_periods=1, center=True).mean().to_numpy()
+    t, temp, temp_smooth = m["t"], m["temp"], m["temp_smooth"]
+    sp, band = m["SP"], m["band"]
 
     fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(t, temp, color="lightsteelblue", linewidth=0.8, label="Suhu mentah")
-    ax.plot(t, temp_smooth, color="blue", linewidth=1.8,
-            label="Suhu (halus, rolling-%d, tampilan saja)" % smooth_window)
-    ax.axhline(m["SP"], color="green", linestyle="--", linewidth=1.5, label="Setpoint")
+    ax.axhspan(sp - band, sp + band, color="green", alpha=0.12,
+               label="Toleransi +-%.0f%% SP" % m["band_pct"], zorder=0)
+    ax.plot(t, temp, color="gray", alpha=0.4, linewidth=0.8, label="Suhu mentah")
+    ax.plot(t, temp_smooth, color="red", linewidth=1.8,
+            label="Suhu halus (rolling-%d)" % smooth_window)
+    ax.axhline(sp, color="green", linestyle="--", linewidth=1.5, label="Setpoint")
 
-    peak_idx = int(temp.argmax() if m["rising"] else temp.argmin())
+    peak_idx = int(np.nanargmax(temp) if m["rising"] else np.nanargmin(temp))
     ax.plot(t[peak_idx], temp[peak_idx], "r^", markersize=10, zorder=5)
-    ax.annotate("Overshoot %.1f%% (thd SP)" % m["overshoot_sp"],
+    ax.annotate("Overshoot %.1f%%" % m["overshoot_sp"],
                 xy=(t[peak_idx], temp[peak_idx]), xytext=(15, -18), textcoords="offset points",
                 fontsize=9, color="red", arrowprops=dict(arrowstyle="->", color="red"),
                 bbox=dict(boxstyle="round", facecolor="white", edgecolor="red", alpha=0.85))
 
     if m["i10"] is not None and m["i90"] is not None:
-        ax.plot(t[m["i10"]], temp[m["i10"]], "ko", markersize=5)
+        ax.plot(t[m["i10"]], temp[m["i10"]], "ko", markersize=5, label="Rise time start/end")
         ax.plot(t[m["i90"]], temp[m["i90"]], "ko", markersize=5)
         ax.annotate("Rise time = %.1fs" % m["rise_time"],
                     xy=(t[m["i90"]], temp[m["i90"]]), xytext=(10, -22), textcoords="offset points",
@@ -196,7 +206,8 @@ def plot_result(m, out_path, smooth_window):
     settle_label = "Settling = %.1fs\n(band +-%.0f%%)" % (m["settling_time"], m["band_pct"])
     if m["never_settled"]:
         settle_label += "\n(!) belum settle"
-    ax.axvline(m["settling_time"], color="purple", linestyle=":", linewidth=1.5)
+    ax.axvline(m["settling_time"], color="purple", linestyle=":", linewidth=1.5,
+               label="Settling time")
     ax.annotate(settle_label, xy=(m["settling_time"], 1), xycoords=("data", "axes fraction"),
                 xytext=(6, -6), textcoords="offset points", fontsize=8, color="purple",
                 va="top", ha="left", bbox=dict(boxstyle="round", facecolor="white",
@@ -204,10 +215,10 @@ def plot_result(m, out_path, smooth_window):
 
     ax.set_xlabel("Waktu (s)")
     ax.set_ylabel("Suhu (C)")
-    ax.set_title("Analisis Respons Suhu — SP=%.1f°C" % m["SP"])
+    ax.set_title("Respon Sistem PID Pyrolysis — SP=%.1f°C" % sp)
     # Legend DI LUAR area plot (di bawah) -- data & anotasi bentuknya beda-beda
     # tiap run, jadi tidak ada satu sudut pun di dalam axes yang aman dari tabrakan.
-    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=2, fontsize=8)
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.14), ncol=3, fontsize=8)
     ax.grid(True, alpha=0.3)
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -215,16 +226,66 @@ def plot_result(m, out_path, smooth_window):
 
 
 def print_summary(m):
-    print("\n=== RINGKASAN HASIL ===")
-    print("Setpoint (SP)          : %.1f C" % m["SP"])
-    print("Suhu awal (T0)          : %.1f C" % m["T0"])
-    print("Rise Time               : %.1f s" % m["rise_time"])
-    settle_note = "  (!) belum settle sampai akhir segmen" if m["never_settled"] else ""
-    print("Settling Time (+-%.0f%%, halus): %.1f s%s" % (m["band_pct"], m["settling_time"], settle_note))
-    print("Overshoot (thd SP)      : %.1f %%" % m["overshoot_sp"])
-    print("Overshoot (thd SP-T0)   : %.1f %%  (definisi klasik: dibagi rentang kenaikan, bukan SP)" % m["overshoot_span"])
-    print("Steady State (Tss)      : %.1f C" % m["Tss"])
-    print("SS Error                : %.1f C" % m["sse"])
+    rows = [
+        ("Setpoint", "%.1f C" % m["SP"]),
+        ("Suhu Awal (T0)", "%.1f C" % m["T0"]),
+        ("Suhu Puncak", "%.1f C" % m["Tpeak"]),
+        ("Rise Time", "%.0f s" % m["rise_time"]),
+        ("Overshoot", "%.1f %%" % m["overshoot_sp"]),
+        ("Settling Time", "%.0f s%s" % (m["settling_time"], " (!)" if m["never_settled"] else "")),
+        ("Steady State", "%.1f C" % m["Tss"]),
+        ("SS Error", "%.1f C" % m["sse"]),
+    ]
+    label_w = max(len(r[0]) for r in rows)
+    val_w = max(len(r[1]) for r in rows)
+    inner_w = max(label_w + val_w + 3, len("HASIL ANALISIS SISTEM PID"))
+    title = "HASIL ANALISIS SISTEM PID"
+
+    print()
+    print("┌" + "─" * (inner_w + 2) + "┐")
+    print("│ %s │" % title.center(inner_w))
+    print("├" + "─" * (inner_w + 2) + "┤")
+    for label, val in rows:
+        line = "%s : %s" % (label.ljust(label_w), val.rjust(val_w))
+        print("│ %s │" % line.ljust(inner_w))
+    print("└" + "─" * (inner_w + 2) + "┘")
+    if m["never_settled"]:
+        print("(!) belum settle sampai akhir segmen -- Steady State dihitung dari 10%% sampel terakhir")
+    print("Overshoot (vs rentang SP-T0, definisi klasik buku teks): %.1f %%" % m["overshoot_span"])
+
+
+def plot_table(m, out_path):
+    rows = [
+        ("Setpoint", "%.1f °C" % m["SP"]),
+        ("Suhu Awal T0", "%.1f °C" % m["T0"]),
+        ("Suhu Puncak", "%.1f °C" % m["Tpeak"]),
+        ("Rise Time", "%.0f s" % m["rise_time"]),
+        ("Overshoot", "%.1f %%" % m["overshoot_sp"]),
+        ("Settling Time", "%.0f s" % m["settling_time"]),
+        ("Steady State", "%.1f °C" % m["Tss"]),
+        ("SS Error", "%.1f °C" % m["sse"]),
+    ]
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.axis("off")
+    tabel = ax.table(cellText=rows, colLabels=["Parameter", "Nilai"],
+                      loc="center", cellLoc="left")
+    tabel.auto_set_font_size(False)
+    tabel.set_fontsize(13)
+    tabel.scale(1.5, 2.2)
+
+    for (row, col), cell in tabel.get_celld().items():
+        cell.set_edgecolor("#999999")
+        if row == 0:
+            cell.set_facecolor("#1f4e79")
+            cell.set_text_props(color="white", fontweight="bold")
+        else:
+            cell.set_facecolor("#dce6f1" if row % 2 == 0 else "white")
+
+    plt.title("HASIL ANALISIS SISTEM PID PYROLYSIS", fontsize=14, fontweight="bold", pad=20)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print("Tabel tersimpan: %s" % out_path)
 
 
 def main():
@@ -234,8 +295,9 @@ def main():
     p.add_argument("--run", type=int, default=0, help="pilih segmen dari belakang: 0=terakhir, 1=sblm itu, dst")
     p.add_argument("--list", action="store_true", help="tampilkan semua segmen yang ditemukan lalu keluar")
     p.add_argument("--band", type=float, default=0.05, help="band settling time, pecahan dari SP (default 0.05 = +-5%%)")
-    p.add_argument("--smooth", type=int, default=5, help="jumlah sampel rolling average utk grafik (default 5)")
-    p.add_argument("--out", help="path PNG keluaran (default: <nama csv>_analysis.png)")
+    p.add_argument("--smooth", type=int, default=10, help="jumlah sampel rolling average utk grafik+settling (default 10)")
+    p.add_argument("--out", help="path PNG grafik keluaran (default: <nama csv>_analysis.png)")
+    p.add_argument("--out-table", help="path PNG tabel hasil (default: <nama csv>_hasil_pid.png)")
     args = p.parse_args()
 
     df = load_csv(args.csv)
@@ -269,6 +331,9 @@ def main():
 
     out_path = args.out or (args.csv.rsplit(".", 1)[0] + "_analysis.png")
     plot_result(m, out_path, smooth_window=args.smooth)
+
+    out_table_path = args.out_table or (args.csv.rsplit(".", 1)[0] + "_hasil_pid.png")
+    plot_table(m, out_table_path)
     return 0
 
 
