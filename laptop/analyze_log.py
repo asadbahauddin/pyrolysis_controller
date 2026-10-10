@@ -288,6 +288,21 @@ def plot_table(m, out_path):
     print("Tabel tersimpan: %s" % out_path)
 
 
+def plot_fan(t, fan, sp, out_path):
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(t, fan, color="darkorange", linewidth=1.3, label="Fan (%)")
+    ax.fill_between(t, fan, color="darkorange", alpha=0.15)
+    ax.set_xlabel("Waktu (s)")
+    ax.set_ylabel("Fan (%)")
+    ax.set_ylim(-5, 105)
+    ax.set_title("Grafik Fan — SP=%.1f°C" % sp)
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="upper right", fontsize=8)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print("Grafik fan tersimpan: %s" % out_path)
+
+
 def main():
     p = argparse.ArgumentParser(description="Analisis offline CSV log suhu (rise/settling time, overshoot)")
     p.add_argument("csv", help="path file CSV (hasil logger.py atau CSV generik timestamp/suhu/setpoint/fan/mode)")
@@ -298,6 +313,7 @@ def main():
     p.add_argument("--smooth", type=int, default=10, help="jumlah sampel rolling average utk grafik+settling (default 10)")
     p.add_argument("--out", help="path PNG grafik keluaran (default: <nama csv>_analysis.png)")
     p.add_argument("--out-table", help="path PNG tabel hasil (default: <nama csv>_hasil_pid.png)")
+    p.add_argument("--out-fan", help="path PNG grafik fan (default: <nama csv>_fan.png)")
     args = p.parse_args()
 
     df = load_csv(args.csv)
@@ -334,6 +350,10 @@ def main():
 
     out_table_path = args.out_table or (args.csv.rsplit(".", 1)[0] + "_hasil_pid.png")
     plot_table(m, out_table_path)
+
+    fan = seg_df.reset_index(drop=True)["fan"].to_numpy()
+    out_fan_path = args.out_fan or (args.csv.rsplit(".", 1)[0] + "_fan.png")
+    plot_fan(m["t"], fan, m["SP"], out_fan_path)
     return 0
 
 
